@@ -557,6 +557,11 @@ export class ArchiveManager {
     return this.cache.get(packageId);
   }
 
+  // 销毁后驱逐内存投影：下次 open 会按（已不存在的）目录重新建立空归档。
+  evict(packageId) {
+    this.cache.delete(packageId);
+  }
+
   list() {
     const dir = join(this.rootDir, 'packages');
     if (!existsSync(dir)) return [];

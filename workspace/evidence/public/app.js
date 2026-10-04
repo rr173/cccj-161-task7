@@ -119,9 +119,18 @@ async function refreshPackages(selectId = SELECTED) {
       ? `v${p.currentFence.version} ${p.currentFence.closed ? '·已关闭' : '·活动'}` : '无围栏';
     const prog = p.currentProgress
       ? `lastSeq=${p.currentProgress.lastSeq}${p.currentProgress.carried ? '·沿用' : ''}` : '无检查点';
+    let lifeTag = '';
+    if (p.destroyedState === 'DESTROYED') lifeTag = '<span class="tag err">已销毁</span>';
+    else if (p.destroyedState === 'COMMITTING') lifeTag = '<span class="tag warn">销毁提交中</span>';
+    else if (p.retention) {
+      if (p.retention.activeHoldCount > 0) lifeTag = `<span class="tag info">保全×${p.retention.activeHoldCount}</span>`;
+      else if (p.retention.destructionDue) lifeTag = '<span class="tag warn">待销毁</span>';
+      else lifeTag = '<span class="tag ok">保留中</span>';
+    }
     div.innerHTML = `<div><b>${esc(p.packageId)}</b>
-        <span class="tag ${p.conflictCount ? 'err' : 'ok'}">冲突 ${p.conflictCount}</span></div>
-      <div class="muted mono">${esc(p.reportDigest.slice(0, 20))}…</div>
+        <span class="tag ${p.conflictCount ? 'err' : 'ok'}">冲突 ${p.conflictCount}</span>
+        ${lifeTag}</div>
+      <div class="muted mono">${p.reportDigest ? esc(p.reportDigest.slice(0, 20)) + '…' : '（证据已销毁，仅存回执）'}</div>
       <div class="muted">围栏：${esc(fence)} ｜ 进度：${esc(prog)} ｜ 记录 ${p.acceptedRecordCount}</div>`;
     div.onclick = () => { SELECTED = p.packageId; renderDetail(); refreshPackages(p.packageId); };
     $('pkgList').appendChild(div);
@@ -134,8 +143,34 @@ $('btnRefresh').onclick = () => refreshPackages().then(() => toast('已刷新', 
 // ---------- 详情/报告 ----------
 async function renderDetail() {
   if (!SELECTED) return;
+  // 已销毁/提交中：详情区显示销毁墓碑，不再拉证据报告（读接口统一 410）。
+  const listItem = REPORTS.get(SELECTED);
+  if (listItem && listItem.destroyedState) {
+    $('detail').innerHTML = destroyedDetailHTML(listItem);
+    return;
+  }
   const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/report`);
   $('detail').innerHTML = reportHTML(r);
+}
+
+function destroyedDetailHTML(p) {
+  const committing = p.destroyedState === 'COMMITTING';
+  return `<div class="row" style="justify-content:space-between">
+      <div><b>${esc(p.packageId)}</b> <span class="tag ${committing ? 'warn' : 'err'}">${committing ? '销毁提交中' : '已销毁'}</span></div>
+      <div class="row">
+        <button id="btnDetailReceipt">${committing ? '查看状态' : '查看销毁回执'}</button>
+        <button id="btnDetailVerifyReceipt">回执验签</button>
+        <button id="btnDetailRecover" ${committing ? '' : 'style="display:none"'}>恢复中断的销毁</button>
+      </div>
+    </div>
+    <h3>销毁状态</h3>
+    <div>destructionId：<code>${esc(p.destructionId || '-')}</code></div>
+    <div class="muted" style="margin-top:6px">
+    ${committing
+      ? '销毁正在提交：读接口统一按已销毁处理；物理删除未完成，服务恢复或点击“恢复中断的销毁”后续完到唯一结果。'
+      : '业务索引、链文件、冲突材料与每包凭据旁车均已删除；仅保留不含原始证据的签名销毁回执（可独立验签）。'}
+    </div>
+    <pre id="detailReceiptOut" class="out" style="margin-top:8px">（点击右上角按钮查看回执/验签）</pre>`;
 }
 
 function reportHTML(r) {
@@ -256,3 +291,149 @@ $('btnRestart').onclick = async () => {
 loadGateways().catch(() => {});
 refreshPackages().catch(() => {});
 setInterval(() => refreshPackages().catch(() => {}), 15000);
+
+// ============================================================
+// ⑥ 证据保全与到期销毁
+// ============================================================
+function setOut(text) { $('retentionOut').textContent = ensureNoSecret(typeof text === 'string' ? text : JSON.stringify(text, null, 2)); }
+
+$('btnRetentionRefresh').onclick = async () => {
+  try {
+    const r = await api('/api/retention');
+    setOut(r);
+    toast(`已加载 ${r.packages.length} 个包的保留状态`, 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+};
+$('btnDue').onclick = async () => {
+  try {
+    const r = await api('/api/retention/due');
+    setOut(r);
+    toast(`待销毁 ${r.count} 个`, r.count ? 'warn' : 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+};
+$('btnExpiryTask').onclick = async () => {
+  if (!confirm('执行到期销毁任务？将物理删除所有“保留期已到且无有效保全”的作业包材料。')) return;
+  try {
+    const r = await api('/api/retention/expiry-task', { method: 'POST', body: {}, auth: true });
+    setOut(r);
+    toast(`销毁 ${r.destroyed.length} 个${r.skipped.length ? `，跳过/失败 ${r.skipped.length}` : ''}`, r.destroyed.length ? 'warn' : 'ok');
+    refreshPackages();
+  } catch (e) { toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+$('btnRecover').onclick = async () => {
+  try {
+    const r = await api('/api/retention/recover', { method: 'POST', body: {}, auth: true });
+    setOut(r);
+    toast(`恢复续完 ${r.recovered.length} 个中断的销毁`, r.recovered.length ? 'warn' : 'ok');
+    refreshPackages();
+    if (SELECTED) renderDetail();
+  } catch (e) { toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+
+$('btnSetRetention').onclick = async () => {
+  const body = {
+    requestId: $('rtReq').value.trim(),
+    ...($('rtUntil').value.trim() ? { retainUntil: $('rtUntil').value.trim() } : { retainForDays: Number($('rtDays').value) || undefined }),
+  };
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent($('rtPkg').value.trim())}/retention`,
+      { method: 'POST', body, auth: true });
+    setOut(r);
+    toast(r.idempotent ? '同请求号：返回原设置（幂等）' : '保留期限已设置', 'ok');
+    refreshPackages();
+  } catch (e) { setOut(e); toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+
+$('btnPlaceHold').onclick = async () => {
+  const body = {
+    requestId: $('hdReq').value.trim(),
+    caseNo: $('hdCase').value.trim(),
+    reason: $('hdReason').value.trim(),
+    requestedBy: $('hdBy').value.trim() || undefined,
+  };
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent($('hdPkg').value.trim())}/holds`,
+      { method: 'POST', body, auth: true });
+    setOut(r);
+    toast(r.idempotent ? '同请求号：返回原保全（幂等）' : '证据保全已发起', 'ok');
+    refreshPackages();
+  } catch (e) { setOut(e); toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+
+$('btnReleaseHold').onclick = async () => {
+  const body = { requestId: $('hdRelReq').value.trim() };
+  const locator = $('hdRel').value.trim();
+  if (locator.startsWith('HOLD_')) body.holdId = locator; else body.caseNo = locator;
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent($('hdPkg').value.trim())}/holds/release`,
+      { method: 'POST', body, auth: true });
+    setOut(r);
+    toast(r.idempotent ? '同请求号：解除幂等' : `保全已解除（剩余有效保全 ${r.activeHolds}）`, 'ok');
+    refreshPackages();
+  } catch (e) { setOut(e); toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+
+$('btnDestroy').onclick = async () => {
+  const pkg = $('dsPkg').value.trim();
+  if (!confirm(`确认立即销毁 ${pkg}？\n仅当“保留期已到且全部保全解除”才允许；业务索引/链文件/冲突材料/凭据旁车将被物理删除，只留签名回执。`)) return;
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pkg)}/destroy`, { method: 'POST', body: {}, auth: true });
+    setOut(r);
+    toast(r.alreadyDestroyed ? '此前已销毁：返回原回执（唯一）' : '销毁完成', 'warn');
+    refreshPackages();
+  } catch (e) {
+    setOut(e);
+    if (e.code === 'STORAGE_DELETE_FAILED') {
+      toast('存储删除失败：已进入“销毁提交中”，可点“恢复中断的销毁”续完', 'warn');
+      refreshPackages();
+    } else {
+      toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err');
+    }
+  }
+};
+
+$('btnReceipt').onclick = async () => {
+  const pkg = $('vfPkg').value.trim();
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pkg)}/destruction-receipt`);
+    setOut(r);
+    toast('已加载签名销毁回执（不含原始证据）', 'ok');
+  } catch (e) { setOut(e); toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+$('btnVerifyReceipt').onclick = async () => {
+  const pkg = $('vfPkg').value.trim();
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(pkg)}/destruction-receipt/verify`);
+    setOut(r);
+    if (r.state === 'DESTROYED') toast(r.signatureValid && r.registered ? '回执验签通过且登记上链' : '回执验签失败！', r.signatureValid && r.registered ? 'ok' : 'err');
+    else toast('销毁提交中，回执尚未最终落定', 'warn');
+  } catch (e) { setOut(e); toast(`${e.code || '错误'}：${safeText(e.message)}`, 'err'); }
+};
+
+// 详情区销毁墓碑上的按钮（事件委托）
+document.addEventListener('click', async (ev) => {
+  const id = ev.target.id;
+  if (!id || !SELECTED) return;
+  try {
+    if (id === 'btnDetailReceipt') {
+      const r = await apiRawJson(`/api/packages/${encodeURIComponent(SELECTED)}/destruction-receipt`);
+      $('detailReceiptOut').textContent = ensureNoSecret(JSON.stringify(r, null, 2));
+    } else if (id === 'btnDetailVerifyReceipt') {
+      const r = await apiRawJson(`/api/packages/${encodeURIComponent(SELECTED)}/destruction-receipt/verify`);
+      $('detailReceiptOut').textContent = ensureNoSecret(JSON.stringify(r, null, 2));
+    } else if (id === 'btnDetailRecover') {
+      await api('/api/retention/recover', { method: 'POST', body: {}, auth: true });
+      toast('已尝试恢复中断的销毁', 'ok');
+      await refreshPackages(SELECTED);
+    }
+  } catch (e) {
+    if ($('detailReceiptOut')) $('detailReceiptOut').textContent = ensureNoSecret(`${e.code || '错误'}：${e.message}`);
+  }
+});
+async function apiRawJson(path) {
+  const res = await fetch(path);
+  const t = await res.text();
+  const data = JSON.parse(ensureNoSecret(t));
+  if (!res.ok) throw Object.assign(new Error(data.error || `HTTP ${res.status}`), { code: data.code });
+  return data;
+}

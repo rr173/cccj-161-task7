@@ -108,6 +108,69 @@
       <div id="detail" class="muted">选择左侧作业包查看报告。</div>
     </section>
   </div>
+
+  <section class="card">
+    <h2>⑥ 证据保全与到期销毁（保留期限 / 保全解除 / 待销毁 / 立即执行 / 失败恢复 / 回执验签）</h2>
+    <div class="row" style="margin-bottom:10px">
+      <button id="btnRetentionRefresh" class="primary">刷新保留状态</button>
+      <button id="btnDue">查看待销毁列表</button>
+      <button id="btnExpiryTask">执行到期销毁任务</button>
+      <button id="btnRecover">恢复中断的销毁</button>
+      <span id="retentionFault" class="muted"></span>
+    </div>
+    <div class="grid2">
+      <div>
+        <h3>设置保留期限</h3>
+        <div class="row">
+          <div style="flex:2"><label>packageId</label><input id="rtPkg" type="text" placeholder="PKG-..."></div>
+          <div style="flex:1"><label>requestId</label><input id="rtReq" type="text" placeholder="REQ-RET-1"></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:2"><label>保留到（ISO8601，留空则用天数）</label><input id="rtUntil" type="text" placeholder="2026-12-31T00:00:00Z"></div>
+          <div style="flex:1"><label>或保留天数</label><input id="rtDays" type="text" placeholder="30"></div>
+          <div style="align-self:flex-end"><button id="btnSetRetention">设置保留期</button></div>
+        </div>
+        <h3 style="margin-top:12px">证据保全 / 解除</h3>
+        <div class="row">
+          <div style="flex:2"><label>packageId</label><input id="hdPkg" type="text" placeholder="PKG-..."></div>
+          <div style="flex:1"><label>requestId</label><input id="hdReq" type="text" placeholder="REQ-HOLD-1"></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:1"><label>案件号 caseNo</label><input id="hdCase" type="text" placeholder="CASE-2026-0001"></div>
+          <div style="flex:1"><label>申请人（可选）</label><input id="hdBy" type="text" placeholder="auditor-A"></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:2"><label>保全原因 reason</label><input id="hdReason" type="text" placeholder="涉案冻结"></div>
+          <div style="align-self:flex-end"><button class="primary" id="btnPlaceHold">发起保全</button></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:2"><label>解除：holdId 或 caseNo</label><input id="hdRel" type="text" placeholder="HOLD_... 或 CASE-2026-0001"></div>
+          <div style="flex:1"><label>解除 requestId</label><input id="hdRelReq" type="text" placeholder="REQ-REL-1"></div>
+          <div style="align-self:flex-end"><button id="btnReleaseHold">解除保全</button></div>
+        </div>
+      </div>
+      <div>
+        <h3>立即销毁 / 回执验签</h3>
+        <div class="row">
+          <div style="flex:2"><label>packageId</label><input id="dsPkg" type="text" placeholder="PKG-..."></div>
+          <div style="align-self:flex-end"><button class="danger" id="btnDestroy">立即销毁</button></div>
+        </div>
+        <div class="row" style="margin-top:6px">
+          <div style="flex:2"><label>验签 packageId</label><input id="vfPkg" type="text" placeholder="PKG-..."></div>
+          <div style="align-self:flex-end">
+            <button id="btnReceipt">查看回执</button>
+            <button id="btnVerifyReceipt">验签</button>
+          </div>
+        </div>
+        <h4>保留/保全/销毁状态</h4>
+        <pre id="retentionOut" class="out">（尚未查询）</pre>
+      </div>
+    </div>
+    <div class="secret-note">
+      销毁为两阶段：先落“销毁令 + 签名回执”（COMMITTING，读接口统一显示已销毁），再物理删除业务索引、链文件、冲突材料与每包凭据旁车；
+      存储故障后可用“恢复中断的销毁”续完，回执始终唯一。回执由每包专属 Ed25519 保管密钥签名（公钥随保留链分发，私钥在销毁时一并删除），不含原始证据。
+    </div>
+  </section>
 </main>
 <div id="toasts"></div>
 <script src="/app.js"></script>

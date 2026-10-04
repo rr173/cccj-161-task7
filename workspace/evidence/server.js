@@ -18,6 +18,7 @@ import {
   GatewayRegistry, loadOrCreateUploadSecret, safeEqual, generateGatewayKeyPair,
 } from './crypto.js';
 import { redact, safeLog } from './hashing.js';
+import { RetentionService, RetentionError } from './retention.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'public');
@@ -54,6 +55,12 @@ export async function createApp(deps = {}) {
     join(dataDir, 'upload-secret.json'), process.env.EVIDENCE_UPLOAD_SECRET);
   const uploadSecret = deps.uploadSecret ?? secretInfo.secret;
   const logger = deps.logger ?? new EvidenceLogger(join(dataDir, 'audit-server.log'), { secret: uploadSecret });
+  // 保留期限 / 证据保全 / 到期销毁（全局保留链 + 每包凭据旁车）。构造时自动恢复中断的销毁。
+  const retention = deps.retention ?? new RetentionService(dataDir, {
+    clock: deps.clock,
+    fs: deps.fs,
+    onDestroyed: (packageId) => manager.evict(packageId),
+  });
 
   const MIME = {
     '.html': 'text/html; charset=utf-8',
@@ -114,9 +121,40 @@ export async function createApp(deps = {}) {
     return report;
   }
 
+  // 销毁读闸：COMMITTING / DESTROYED 的包，任何“证据读取”统一返回已销毁状态（410），
+  // 不可能看到部分删除；销毁提交之前仍返回完整旧报告。
+  function destroyedGate(packageId) {
+    return retention.destroyedView(packageId);
+  }
+
+  // 读取证据前过闸：已提交销毁统一 410 + 销毁状态（不含任何原始证据）。
+  function requireNotDestroyed(packageId) {
+    const d = destroyedGate(packageId);
+    if (d) {
+      throw Object.assign(new Error(d.note), { code: 'PACKAGE_DESTROYED', status: 410, details: d });
+    }
+  }
+
+  // 在完整报告上附加保留/保全状态（仅 ACTIVE 包）。
+  function withRetention(report) {
+    const st = retention.status(report.packageId);
+    if (st && st.destroyedState) return null; // 已进入销毁：调用方应走 410
+    return {
+      ...report,
+      retention: st ? {
+        retention: st.retention,
+        activeHoldCount: st.activeHoldCount,
+        holds: st.holds,
+        destructionDue: st.destructionDue,
+      } : { retention: null, activeHoldCount: 0, holds: [], destructionDue: false },
+    };
+  }
+
   // 进程级重启等价物：丢弃所有缓存的归档对象，从磁盘重放重建。
   function restartFromDisk() {
     manager.cache.clear();
+    // 保留/保全/销毁状态机也从全局保留链重放（reload 会自动续完中断的销毁）。
+    retention.reload();
   }
 
   const server = createServer(async (req, res) => {
@@ -152,8 +190,12 @@ export async function createApp(deps = {}) {
       // ---------- 包列表 / 状态 ----------
       if (path === '/api/packages' && req.method === 'GET') {
         const ids = manager.list();
+        const destroyedIds = new Set();
         const items = ids.map((id) => {
           const r = packageView(id);
+          const st = retention.status(id);
+          const destroyed = st?.destroyedState ? st : null;
+          if (destroyed) destroyedIds.add(id);
           return {
             packageId: id,
             reportDigest: r.reportDigest,
@@ -162,8 +204,34 @@ export async function createApp(deps = {}) {
             acceptedRecordCount: r.acceptedRecordCount,
             conflictCount: r.conflictCount,
             fenceCount: r.fenceCount,
+            retention: st && !destroyed ? {
+              retention: st.retention,
+              activeHoldCount: st.activeHoldCount,
+              destructionDue: st.destructionDue,
+              holdCases: st.holds.filter((h) => h.active).map((h) => h.caseNo),
+            } : null,
+            destroyedState: destroyed?.destroyedState || null,
+            destructionId: destroyed?.destructionId || null,
           };
         });
+        // 已物理删除目录但保留链仍有墓碑的包（重启后 manager.list 不再包含它们）。
+        for (const st of retention.listAll()) {
+          if (!st || !st.destroyedState) continue;
+          if (destroyedIds.has(st.packageId)) continue;
+          items.push({
+            packageId: st.packageId,
+            reportDigest: null,
+            currentFence: null,
+            currentProgress: null,
+            acceptedRecordCount: 0,
+            conflictCount: 0,
+            fenceCount: 0,
+            retention: null,
+            destroyedState: st.destroyedState,
+            destructionId: st.destructionId,
+          });
+        }
+        items.sort((a, b) => (a.packageId < b.packageId ? -1 : a.packageId > b.packageId ? 1 : 0));
         return send(res, 200, { packages: items });
       }
 
@@ -171,6 +239,7 @@ export async function createApp(deps = {}) {
       if (importPath && req.method === 'POST') {
         requireSecret(req);
         const packageId = decodeURIComponent(importPath[1]);
+        requireNotDestroyed(packageId);
         const archive = manager.open(packageId);
         try {
           const out = archive.importEnvelope(body, { registry, nowIso: at });
@@ -205,12 +274,16 @@ export async function createApp(deps = {}) {
       // ---------- 报告与导出 ----------
       const reportMatch = path.match(/^\/api\/packages\/([^/]+)\/report$/);
       if (reportMatch && req.method === 'GET') {
-        const r = packageView(decodeURIComponent(reportMatch[1]));
+        const packageId = decodeURIComponent(reportMatch[1]);
+        requireNotDestroyed(packageId);
+        const r = withRetention(packageView(packageId));
         return send(res, 200, exportRedactedJSON(r, [uploadSecret]));
       }
       const exportMatch = path.match(/^\/api\/packages\/([^/]+)\/report\.(json|txt|html)$/);
       if (exportMatch && req.method === 'GET') {
-        const r = packageView(decodeURIComponent(exportMatch[1]));
+        const packageId = decodeURIComponent(exportMatch[1]);
+        requireNotDestroyed(packageId);
+        const r = withRetention(packageView(packageId));
         const fmt = exportMatch[2];
         if (fmt === 'json') {
           return send(res, 200, JSON.stringify(exportRedactedJSON(r, [uploadSecret]), null, 2), {
@@ -229,18 +302,24 @@ export async function createApp(deps = {}) {
 
       const timelineMatch = path.match(/^\/api\/packages\/([^/]+)\/timeline$/);
       if (timelineMatch && req.method === 'GET') {
-        const r = packageView(decodeURIComponent(timelineMatch[1]));
+        const packageId = decodeURIComponent(timelineMatch[1]);
+        requireNotDestroyed(packageId);
+        const r = packageView(packageId);
         return send(res, 200, redact({ packageId: r.packageId, timeline: r.timeline }, [uploadSecret]));
       }
       const conflictMatch = path.match(/^\/api\/packages\/([^/]+)\/conflicts$/);
       if (conflictMatch && req.method === 'GET') {
-        const r = packageView(decodeURIComponent(conflictMatch[1]));
+        const packageId = decodeURIComponent(conflictMatch[1]);
+        requireNotDestroyed(packageId);
+        const r = packageView(packageId);
         return send(res, 200, redact({ packageId: r.packageId, conflicts: r.conflicts }, [uploadSecret]));
       }
       const oldFenceMatch = path.match(/^\/api\/packages\/([^/]+)\/fences\/(\d+)$/);
       if (oldFenceMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(oldFenceMatch[1]);
+        requireNotDestroyed(packageId);
         // 旧围栏证据仍可查询（按版本），响应标注它不是当前围栏/当前进度。
-        const r = packageView(decodeURIComponent(oldFenceMatch[1]));
+        const r = packageView(packageId);
         const v = Number(oldFenceMatch[2]);
         const f = r.fences.find((x) => x.version === v);
         if (!f) throw Object.assign(new Error(`围栏版本 v${v} 不存在`), { code: 'FENCE_UNKNOWN', status: 404 });
@@ -258,18 +337,130 @@ export async function createApp(deps = {}) {
       if (path === '/api/chain/verify' && req.method === 'GET') {
         const out = {};
         for (const id of manager.list()) out[id] = manager.open(id).verify();
-        return send(res, 200, { packages: out });
+        return send(res, 200, { packages: out, retention: retention.verifyChain() });
       }
       const verifyPkg = path.match(/^\/api\/packages\/([^/]+)\/verify$/);
       if (verifyPkg && req.method === 'GET') {
-        return send(res, 200, manager.open(decodeURIComponent(verifyPkg[1])).verify());
+        const packageId = decodeURIComponent(verifyPkg[1]);
+        requireNotDestroyed(packageId);
+        return send(res, 200, manager.open(packageId).verify());
       }
 
       // ---------- 导入裁决审计（脱敏）----------
       const importsMatch = path.match(/^\/api\/packages\/([^/]+)\/imports$/);
       if (importsMatch && req.method === 'GET') {
-        const r = packageView(decodeURIComponent(importsMatch[1]));
+        const packageId = decodeURIComponent(importsMatch[1]);
+        requireNotDestroyed(packageId);
+        const r = packageView(packageId);
         return send(res, 200, redact({ packageId: r.packageId, imports: r.imports }, [uploadSecret]));
+      }
+
+      // ============================================================
+      // 保留期限 / 证据保全 / 到期销毁
+      // ============================================================
+
+      // 待销毁列表（保留期限已到、无有效保全）与全部保留状态
+      if (path === '/api/retention/due' && req.method === 'GET') {
+        return send(res, 200, { at: at, count: retention.listDue().length, packages: retention.listDue() });
+      }
+      if (path === '/api/retention' && req.method === 'GET') {
+        return send(res, 200, { at: at, packages: retention.listAll() });
+      }
+      // 到期任务：立即扫描并销毁所有已到期且无保全的包
+      if (path === '/api/retention/expiry-task' && req.method === 'POST') {
+        requireSecret(req);
+        const out = retention.runExpiryTask(at);
+        logger.log({ level: 'info', msg: 'retention-expiry-task', destroyed: out.destroyed.length, count: out.skipped.length });
+        return send(res, 200, out);
+      }
+
+      // 单包保留/保全状态
+      const retentionStatusMatch = path.match(/^\/api\/packages\/([^/]+)\/retention$/);
+      if (retentionStatusMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(retentionStatusMatch[1]);
+        const st = retention.status(packageId);
+        if (!st) return send(res, 404, { error: '作业包尚无保留策略记录', code: 'PACKAGE_NOT_FOUND' });
+        return send(res, 200, st);
+      }
+      // 运营设置保留期限
+      const retentionSetMatch = path.match(/^\/api\/packages\/([^/]+)\/retention$/);
+      if (retentionSetMatch && req.method === 'POST') {
+        requireSecret(req);
+        const out = retention.setRetention({
+          packageId: decodeURIComponent(retentionSetMatch[1]),
+          requestId: body.requestId,
+          retainUntil: body.retainUntil,
+          retainForDays: body.retainForDays != null ? Number(body.retainForDays) : undefined,
+          retainForSeconds: body.retainForSeconds != null ? Number(body.retainForSeconds) : undefined,
+          setBy: body.setBy,
+        });
+        return send(res, out.idempotent ? 200 : 201, out);
+      }
+      // 审计发起保全（带原因与案件号）
+      const holdPlaceMatch = path.match(/^\/api\/packages\/([^/]+)\/holds$/);
+      if (holdPlaceMatch && req.method === 'POST') {
+        requireSecret(req);
+        const out = retention.placeHold({
+          packageId: decodeURIComponent(holdPlaceMatch[1]),
+          requestId: body.requestId,
+          caseNo: body.caseNo,
+          reason: body.reason,
+          requestedBy: body.requestedBy,
+        });
+        return send(res, out.idempotent ? 200 : 201, out);
+      }
+      // 解除保全
+      const holdReleaseMatch = path.match(/^\/api\/packages\/([^/]+)\/holds\/release$/);
+      if (holdReleaseMatch && req.method === 'POST') {
+        requireSecret(req);
+        const out = retention.releaseHold({
+          packageId: decodeURIComponent(holdReleaseMatch[1]),
+          requestId: body.requestId,
+          holdId: body.holdId,
+          caseNo: body.caseNo,
+          releasedBy: body.releasedBy,
+          reason: body.reason,
+        });
+        return send(res, out.idempotent ? 200 : 200, out);
+      }
+      // 立即执行销毁
+      const destroyMatch = path.match(/^\/api\/packages\/([^/]+)\/destroy$/);
+      if (destroyMatch && req.method === 'POST') {
+        requireSecret(req);
+        const out = retention.destroy({
+          packageId: decodeURIComponent(destroyMatch[1]),
+          requestId: body.requestId,
+          trigger: body.trigger === 'MANUAL' ? 'MANUAL' : (body.trigger || 'MANUAL'),
+          destroyedBy: body.destroyedBy,
+        });
+        logger.log({ level: 'warn', msg: 'package-destroyed', packageId: out.packageId,
+          destructionId: out.destructionId, records: out.alreadyDestroyed ? 0 : 1 });
+        return send(res, 200, out);
+      }
+      // 失败后恢复：继续所有卡在 COMMITTING 的销毁到唯一结果
+      if (path === '/api/retention/recover' && req.method === 'POST') {
+        requireSecret(req);
+        const recovered = retention.recoverCommitting();
+        return send(res, 200, { recovered, lastRecoveryError: retention.lastRecoveryError });
+      }
+      // 销毁回执（不含原始证据）与验签
+      const receiptMatch = path.match(/^\/api\/packages\/([^/]+)\/destruction-receipt$/);
+      if (receiptMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(receiptMatch[1]);
+        const signed = retention.signedReceipt(packageId);
+        if (!signed) {
+          const d = retention.destroyedView(packageId);
+          if (d) return send(res, 409, { error: d.note, code: 'DESTRUCTION_IN_PROGRESS', details: d });
+          return send(res, 404, { error: '该作业包没有销毁回执', code: 'RECEIPT_NOT_FOUND' });
+        }
+        return send(res, 200, redact(signed, [uploadSecret]));
+      }
+      const receiptVerifyMatch = path.match(/^\/api\/packages\/([^/]+)\/destruction-receipt\/verify$/);
+      if (receiptVerifyMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(receiptVerifyMatch[1]);
+        const v = retention.verifyReceipt(packageId);
+        if (!v) return send(res, 404, { error: '该作业包没有销毁回执', code: 'RECEIPT_NOT_FOUND' });
+        return send(res, 200, v);
       }
 
       // ---------- 运营：从磁盘重放重建（等价进程重启）----------
@@ -278,6 +469,28 @@ export async function createApp(deps = {}) {
         restartFromDisk();
         logger.log({ level: 'info', msg: 'replay-restart' });
         return send(res, 200, { restarted: true, packages: manager.list() });
+      }
+
+      // ---------- 演示/测试辅助：存储删除故障注入（仅 EVIDENCE_DEMO=1）----------
+      // 让后续物理删除对命中的 packageId 失败（模拟存储故障），用于验证 COMMITTING 恢复。
+      const faultMatch = path.match(/^\/api\/demo\/fault\/delete$/);
+      if (faultMatch && req.method === 'POST') {
+        if (process.env.EVIDENCE_DEMO !== '1') {
+          throw Object.assign(new Error('演示接口未开启（EVIDENCE_DEMO=1）'), { code: 'DEMO_DISABLED', status: 403 });
+        }
+        requireSecret(req);
+        const mode = String(body.mode || 'off'); // 'fail-package' | 'fail-all' | 'off'
+        const matchPackageId = body.packageId ? String(body.packageId) : null;
+        retention.setDeleteArtifacts(mode === 'off' ? null : (() => {
+          let calls = 0;
+          return (_dir, packageId) => {
+            calls += 1;
+            if (mode === 'fail-all' || packageId === matchPackageId) {
+              throw Object.assign(new Error('注入的存储删除失败'), { code: 'STORAGE_DELETE_FAILED', injected: true, calls });
+            }
+          };
+        })());
+        return send(res, 200, { fault: mode, packageId: matchPackageId });
       }
 
       // ---------- 演示辅助：生成网关密钥对（仅在显式开启时；服务端不保存私钥）----------
@@ -291,20 +504,22 @@ export async function createApp(deps = {}) {
 
       return send(res, 404, { error: 'unknown route', path });
     } catch (err) {
-      const status = err.status || (err.code === 'CHAIN_QUARANTINED' ? 503 : 500);
+      // RetentionError 自带 HTTP 状态（400/404/409/410）；其余沿用既有规则。
+      const status = err.status || (err instanceof RetentionError ? 400 : (err.code === 'CHAIN_QUARANTINED' ? 503 : 500));
       if (status === 500) {
         logger.log({ level: 'error', msg: 'internal-error', code: err.code, reason: String(err.message).slice(0, 160) });
       }
+      const noStore = status === 503 || status === 410 || status === 409;
       send(res, status, {
         error: status === 500 ? 'internal error' : err.message,
         code: err.code || 'INTERNAL',
         details: redact(err.details || {}, [uploadSecret]),
-      }, status === 503 ? { 'Retry-After': '300', 'Cache-Control': 'no-store' } : {});
+      }, noStore ? { 'Retry-After': status === 503 ? '300' : '0', 'Cache-Control': 'no-store' } : {});
     }
   });
 
   return {
-    server, manager, registry,
+    server, manager, registry, retention,
     get uploadSecret() { return uploadSecret; },
     restartFromDisk,
     start() {
