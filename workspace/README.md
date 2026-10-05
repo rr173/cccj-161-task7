@@ -16,11 +16,12 @@ npm start                 # http://localhost:8080
 ```
 
 - 设备执行页面（运营台）：http://localhost:8080/
-- 自动化测试：`npm test`（91 个领域/恢复单测，含 12 个通知投递契约、11 个履约异议契约、
-  19 个离线作业包契约、22 个证据归档契约）
+- 自动化测试：`npm test`（111 个领域/恢复单测，含 12 个通知投递契约、11 个履约异议契约、
+  19 个离线作业包契约、22 个证据归档契约、20 个保全与销毁契约）
 - 端到端场景：先 `npm start`，再 `npm run test:e2e`（38 项 HTTP 断言）
 - 离线作业包端到端：`npm run test:e2e:packages`（37 项 HTTP 断言，覆盖过期/重复设备/旧围栏/乱序/重试/移交竞争/恢复续传）
-- **证据归档与冲突核验端到端**：`npm run test:e2e:evidence`（83 项 HTTP 断言，含真实进程重启与脱敏核对）
+- **证据归档与冲突核验端到端**：`npm run test:e2e:evidence`（88 项 HTTP 断言，含真实进程重启与脱敏核对）
+- **证据保全与到期销毁端到端**：`npm run test:e2e:evidence-destroy`（90 项 HTTP 断言，含中断态注入与真实进程重启）
 
 ## 聚合商通知投递模块（独立服务，`notifier/`）
 
@@ -110,8 +111,9 @@ npm run test:e2e:packages   # 37 项真实 HTTP 断言
 
 ```bash
 npm run evidence              # 归档服务 + 页面 → http://localhost:8092/
-npm run demo:evidence         # 9 个故障/合并场景一键演示
-npm run test:e2e:evidence     # 83 项真实 HTTP 断言（含真实进程重启）
+npm run demo:evidence         # 9 个故障/合并场景 + 保全销毁一键演示
+npm run test:e2e:evidence     # 88 项真实 HTTP 断言（含真实进程重启）
+npm run test:e2e:evidence-destroy  # 90 项保全与销毁断言（中断态注入 + 真实进程重启）
 ```
 
 - **证据信封**：`envelopeHash = sha256(canonicalJSON({schema,packageId,gatewayId,keyId,records}))`，
@@ -130,6 +132,11 @@ npm run test:e2e:evidence     # 83 项真实 HTTP 断言（含真实进程重启
   中途篡改即只读隔离（503），末尾断电残尾原样归档后截断续链；真实进程重启后 `reportDigest`、
   冲突列表、链尖逐字节一致。
 - **导出只含脱敏证据**：敏感字段名/私钥 PEM/密钥字面量（含自由文本里夹带的 upload secret）递归打码。
+- **证据保全与到期销毁**：运营设置保留期限，审计在期限内发起带原因+案件号的保全
+  （`requestId` 幂等，同号异文 409）；多保全并存时**全部解除且期限已到**才允许销毁；
+  两阶段提交销毁覆盖业务索引/链文件/冲突材料/凭据旁车，生成**不含原始证据的 Ed25519 签名回执**；
+  提交前读=完整旧状态、提交后统一 410；崩溃可区分尚未开始/正在提交/已完成并恢复到唯一结果，
+  重复执行不生成第二份回执。详见 [`evidence/README.md`](evidence/README.md)。
 
 详见 [`evidence/README.md`](evidence/README.md)。
 
@@ -263,7 +270,11 @@ public/           运营台（index.html + app.js，含隔离/残尾恢复横幅
 test/kernel.test.js   14 个领域单测（node:test）
 test/dispute.test.js  11 个履约异议单测（受理/幂等/材料顺序/终态/重启/投递映射）
 test/package.test.js  18 个离线作业包单测（围栏/乱序合并/幂等/拒绝码/释放移交/过期/重放）
+test/evidence.test.js 22 个证据归档单测（规范化/指纹/脱敏/哈希链/归档裁决/重放）
+test/evidence-lifecycle.test.js 20 个保全与销毁单测（期限/保全幂等/两阶段提交/回执/崩溃恢复/删除失败重试）
 test/recovery.test.js 14 个恢复契约单测（残尾/篡改/断链/503 边界/重启续链/包状态重建，含真实 HTTP）
 scripts/e2e.mjs       38 项 HTTP 端到端断言
 scripts/e2e-packages.mjs 37 项离线作业包 HTTP 断言（过期/重复设备/旧围栏/乱序/重试/移交竞争/撤销）
+scripts/evidence-e2e.mjs 88 项证据归档 HTTP 断言（含真实进程重启与脱敏核对）
+scripts/evidence-destroy-e2e.mjs 90 项保全与销毁 HTTP 断言（中断态注入 + 真实进程重启）
 ```

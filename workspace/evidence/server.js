@@ -9,7 +9,7 @@
 //   - 拒绝信封落盘 0600，读取出口一律 redact。
 import { createServer } from 'node:http';
 import { readFile, appendFile, mkdir } from 'node:fs/promises';
-import { mkdirSync, chmodSync } from 'node:fs';
+import { mkdirSync, chmodSync, unlinkSync, rmdirSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, normalize, extname } from 'node:path';
 import { ArchiveManager } from './archive.js';
@@ -18,6 +18,7 @@ import {
   GatewayRegistry, loadOrCreateUploadSecret, safeEqual, generateGatewayKeyPair,
 } from './crypto.js';
 import { redact, safeLog } from './hashing.js';
+import { LifecycleStore } from './lifecycle.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(__dirname, 'public');
@@ -54,6 +55,40 @@ export async function createApp(deps = {}) {
     join(dataDir, 'upload-secret.json'), process.env.EVIDENCE_UPLOAD_SECRET);
   const uploadSecret = deps.uploadSecret ?? secretInfo.secret;
   const logger = deps.logger ?? new EvidenceLogger(join(dataDir, 'audit-server.log'), { secret: uploadSecret });
+
+  // ---------- 证据保全与到期销毁 ----------
+  const lifecycle = deps.lifecycle ?? new LifecycleStore(dataDir, { now: deps.now });
+  lifecycle.setHooks({
+    // 提交点快照：只取报告摘要/链尖/计数（绝不含原始证据）。
+    snapshot(packageId) {
+      const archive = manager.open(packageId);
+      const report = buildReport(archive);
+      return {
+        reportDigest: report.reportDigest,
+        chainTips: {
+          ledger: { seq: archive.ledger.seq, hash: archive.ledger.tipHash },
+          quarantine: { seq: archive.quarantine.seq, hash: archive.quarantine.tipHash },
+          audit: { seq: archive.audit.seq, hash: archive.audit.tipHash },
+        },
+        counts: {
+          acceptedRecords: report.acceptedRecordCount,
+          conflicts: report.conflictCount,
+          imports: report.imports.length,
+        },
+      };
+    },
+    // 业务索引（内存投影）随提交失效。
+    evict(packageId) {
+      manager.cache.delete(packageId);
+    },
+    listPackages: () => manager.list(),
+    packageExists: (packageId) => manager.list().includes(packageId),
+  });
+  // 启动恢复：中断的销毁继续到唯一结果（尚未开始/正在提交/已完成可区分）。
+  const resumed = lifecycle.recover();
+  for (const r of resumed) {
+    logger.log({ level: 'info', msg: 'destruction-resumed', packageId: r.packageId, status: `${r.from}->${r.to}` });
+  }
 
   const MIME = {
     '.html': 'text/html; charset=utf-8',
@@ -108,7 +143,24 @@ export async function createApp(deps = {}) {
     }
   }
 
+  // 已越过销毁提交点的包：所有证据读接口统一 410（看不到部分删除）。
+  function assertEvidenceReadable(packageId) {
+    if (lifecycle.isDestroyed(packageId)) {
+      const st = lifecycle.destructionStatus(packageId);
+      throw Object.assign(new Error(`作业包 ${packageId} 的证据已销毁（回执 ${st.receiptId}）`), {
+        code: 'PACKAGE_DESTROYED',
+        status: 410,
+        details: {
+          receiptId: st.receiptId,
+          destroyedAt: st.committedAt ?? st.at,
+          receipt: `/api/destructions/${st.receiptId}`,
+        },
+      });
+    }
+  }
+
   function packageView(packageId) {
+    assertEvidenceReadable(packageId);
     const archive = manager.open(packageId);
     const report = buildReport(archive);
     return report;
@@ -117,6 +169,7 @@ export async function createApp(deps = {}) {
   // 进程级重启等价物：丢弃所有缓存的归档对象，从磁盘重放重建。
   function restartFromDisk() {
     manager.cache.clear();
+    return lifecycle.reload(); // 生命周期链同样重放 + 恢复中断的销毁
   }
 
   const server = createServer(async (req, res) => {
@@ -151,9 +204,10 @@ export async function createApp(deps = {}) {
 
       // ---------- 包列表 / 状态 ----------
       if (path === '/api/packages' && req.method === 'GET') {
-        const ids = manager.list();
+        const ids = manager.list().filter((id) => !lifecycle.isDestroyed(id));
         const items = ids.map((id) => {
           const r = packageView(id);
+          const lc = lifecycle.packageLifecycleView(id);
           return {
             packageId: id,
             reportDigest: r.reportDigest,
@@ -162,6 +216,10 @@ export async function createApp(deps = {}) {
             acceptedRecordCount: r.acceptedRecordCount,
             conflictCount: r.conflictCount,
             fenceCount: r.fenceCount,
+            retention: lc.retention ? { retainUntil: lc.retention.retainUntil, expired: lc.retention.expired } : null,
+            activeHoldCount: lc.activeHoldCount,
+            destructionStatus: lc.destruction.status,
+            eligibleForDestruction: lc.eligible,
           };
         });
         return send(res, 200, { packages: items });
@@ -171,6 +229,7 @@ export async function createApp(deps = {}) {
       if (importPath && req.method === 'POST') {
         requireSecret(req);
         const packageId = decodeURIComponent(importPath[1]);
+        assertEvidenceReadable(packageId); // 已销毁：410，绝不重建目录
         const archive = manager.open(packageId);
         try {
           const out = archive.importEnvelope(body, { registry, nowIso: at });
@@ -257,12 +316,21 @@ export async function createApp(deps = {}) {
       // ---------- 哈希链核验 ----------
       if (path === '/api/chain/verify' && req.method === 'GET') {
         const out = {};
-        for (const id of manager.list()) out[id] = manager.open(id).verify();
-        return send(res, 200, { packages: out });
+        for (const id of manager.list()) {
+          if (lifecycle.isDestroyed(id)) {
+            const st = lifecycle.destructionStatus(id);
+            out[id] = { destroyed: true, receiptId: st.receiptId };
+            continue;
+          }
+          out[id] = manager.open(id).verify();
+        }
+        return send(res, 200, { packages: out, lifecycle: lifecycle.chain.verify() });
       }
       const verifyPkg = path.match(/^\/api\/packages\/([^/]+)\/verify$/);
       if (verifyPkg && req.method === 'GET') {
-        return send(res, 200, manager.open(decodeURIComponent(verifyPkg[1])).verify());
+        const packageId = decodeURIComponent(verifyPkg[1]);
+        assertEvidenceReadable(packageId);
+        return send(res, 200, manager.open(packageId).verify());
       }
 
       // ---------- 导入裁决审计（脱敏）----------
@@ -270,6 +338,173 @@ export async function createApp(deps = {}) {
       if (importsMatch && req.method === 'GET') {
         const r = packageView(decodeURIComponent(importsMatch[1]));
         return send(res, 200, redact({ packageId: r.packageId, imports: r.imports }, [uploadSecret]));
+      }
+
+      // ---------- 证据保全与到期销毁 ----------
+      // 保留期限（运营）
+      const retentionMatch = path.match(/^\/api\/packages\/([^/]+)\/retention$/);
+      if (retentionMatch && req.method === 'POST') {
+        requireSecret(req);
+        const packageId = decodeURIComponent(retentionMatch[1]);
+        const out = lifecycle.setRetention(packageId, body);
+        logger.log({
+          level: 'info', msg: out.replay ? 'retention-replayed' : 'retention-set',
+          packageId, setBy: body?.setBy, retainUntil: out.result.retainUntil,
+        });
+        return send(res, out.replay ? 200 : 201, { ...out.result, replay: out.replay });
+      }
+
+      // 单包生命周期视图（期限/保全/销毁状态/资格，可核对）
+      const lifecycleMatch = path.match(/^\/api\/packages\/([^/]+)\/lifecycle$/);
+      if (lifecycleMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(lifecycleMatch[1]);
+        return send(res, 200, redact(lifecycle.packageLifecycleView(packageId), [uploadSecret]));
+      }
+
+      // 保全列表（销毁后仍可查——生命周期事实在全局链上）
+      const holdsListMatch = path.match(/^\/api\/packages\/([^/]+)\/holds$/);
+      if (holdsListMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(holdsListMatch[1]);
+        const view = lifecycle.packageLifecycleView(packageId);
+        return send(res, 200, redact({
+          packageId, holds: view.holds, activeHoldCount: view.activeHoldCount,
+        }, [uploadSecret]));
+      }
+
+      // 发起保全（审计；期限内；requestId 幂等）
+      const holdCreateMatch = path.match(/^\/api\/packages\/([^/]+)\/holds$/);
+      if (holdCreateMatch && req.method === 'POST') {
+        requireSecret(req);
+        const packageId = decodeURIComponent(holdCreateMatch[1]);
+        const out = lifecycle.createHold(packageId, body);
+        logger.log({
+          level: 'info', msg: out.replay ? 'hold-replayed' : 'hold-created',
+          packageId, holdId: out.result.holdId, caseNo: out.result.caseNo, auditor: out.result.auditor,
+        });
+        return send(res, out.replay ? 200 : 201, { ...out.result, replay: out.replay });
+      }
+
+      // 解除保全（案件号必须匹配；并发解除安全失败）
+      const releaseMatch = path.match(/^\/api\/packages\/([^/]+)\/holds\/([^/]+)\/release$/);
+      if (releaseMatch && req.method === 'POST') {
+        requireSecret(req);
+        const packageId = decodeURIComponent(releaseMatch[1]);
+        const holdId = decodeURIComponent(releaseMatch[2]);
+        const out = lifecycle.releaseHold(packageId, holdId, body);
+        logger.log({
+          level: 'info', msg: out.replay ? 'hold-release-replayed' : 'hold-released',
+          packageId, holdId, caseNo: out.result.caseNo,
+        });
+        return send(res, 200, { ...out.result, replay: out.replay });
+      }
+
+      // 销毁状态（尚未开始/正在提交/失败/已完成 + 回执）
+      const dstStatusMatch = path.match(/^\/api\/packages\/([^/]+)\/destruction$/);
+      if (dstStatusMatch && req.method === 'GET') {
+        const packageId = decodeURIComponent(dstStatusMatch[1]);
+        const status = lifecycle.destructionStatus(packageId);
+        const receipt = lifecycle.receiptForPackage(packageId);
+        return send(res, 200, redact({ packageId, ...status, receipt: receipt || null }, [uploadSecret]));
+      }
+
+      // 立即执行销毁（两阶段提交；资格闸与提交同一同步区）
+      const destroyMatch = path.match(/^\/api\/packages\/([^/]+)\/destroy$/);
+      if (destroyMatch && req.method === 'POST') {
+        requireSecret(req);
+        const packageId = decodeURIComponent(destroyMatch[1]);
+        const { requestedBy, reason, _demoFailDelete } = body || {};
+        if (!requestedBy || typeof requestedBy !== 'string') {
+          throw Object.assign(new Error('requestedBy 必填（销毁执行人）'), { code: 'FIELD_REQUIRED', status: 400 });
+        }
+        let deleter;
+        if (_demoFailDelete) {
+          if (process.env.EVIDENCE_DEMO !== '1') {
+            throw Object.assign(new Error('演示接口未开启（EVIDENCE_DEMO=1）'), { code: 'DEMO_DISABLED', status: 403 });
+          }
+          // 演示存储删除失败：首个文件删除即抛错，其余照常（用于演练失败后恢复）。
+          let failed = false;
+          deleter = {
+            unlink(abs) {
+              if (!failed) { failed = true; throw Object.assign(new Error('模拟存储删除失败（EPERM）'), { code: 'EPERM' }); }
+              try { unlinkSync(abs); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+            },
+            rmdir(abs) {
+              try { rmdirSync(abs); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+            },
+          };
+        }
+        const out = lifecycle.executeDestruction(packageId, { requestedBy, reason, deleter });
+        logger.log({
+          level: 'info', msg: out.duplicate ? 'destruction-replayed' : 'destruction-committed',
+          packageId, receiptId: out.receipt.receiptId, requestedBy, status: out.status,
+        });
+        return send(res, 200, redact({
+          packageId, duplicate: out.duplicate, status: out.status, receipt: out.receipt,
+        }, [uploadSecret]));
+      }
+
+      // 失败后恢复：重试物理删除（不产生第二份回执）
+      const retryMatch = path.match(/^\/api\/packages\/([^/]+)\/destruction\/retry$/);
+      if (retryMatch && req.method === 'POST') {
+        requireSecret(req);
+        const packageId = decodeURIComponent(retryMatch[1]);
+        const out = lifecycle.retryDestruction(packageId);
+        logger.log({
+          level: 'info', msg: 'destruction-retried', packageId,
+          receiptId: out.receipt.receiptId, status: out.status,
+        });
+        return send(res, 200, redact({
+          packageId, duplicate: out.duplicate, status: out.status, receipt: out.receipt,
+        }, [uploadSecret]));
+      }
+
+      // 待销毁列表（合格 / 被保全阻塞 / 在途）
+      if (path === '/api/destructions/pending' && req.method === 'GET') {
+        return send(res, 200, redact(lifecycle.pendingDestruction(), [uploadSecret]));
+      }
+
+      // 销毁签名公钥（任何人可独立验签）
+      if (path === '/api/destructions/key' && req.method === 'GET') {
+        return send(res, 200, {
+          keyId: lifecycle.signer.keyId,
+          publicKeyPem: lifecycle.signer.publicKeyPem,
+          algorithm: 'Ed25519',
+          note: 'receiptHash = sha256(canonicalJSON(回执去掉 signature/keyId/receiptHash))；signature 为对该 hex 文本的 Ed25519 签名',
+        });
+      }
+
+      // 到期任务：清扫全部合格包
+      if (path === '/api/destructions/sweep' && req.method === 'POST') {
+        requireSecret(req);
+        const out = lifecycle.sweep({ requestedBy: body?.requestedBy || 'expiry-sweep' });
+        logger.log({
+          level: 'info', msg: 'destruction-swept',
+          destroyed: out.destroyed.length, blocked: out.skipped.length, count: out.errors.length,
+        });
+        return send(res, 200, redact(out, [uploadSecret]));
+      }
+
+      // 全部销毁回执
+      if (path === '/api/destructions' && req.method === 'GET') {
+        return send(res, 200, { receipts: redact(lifecycle.listReceipts(), [uploadSecret]) });
+      }
+
+      // 单份回执 / 验签
+      const receiptMatch = path.match(/^\/api\/destructions\/([^/]+)$/);
+      if (receiptMatch && req.method === 'GET') {
+        const receipt = lifecycle.receiptOf(decodeURIComponent(receiptMatch[1]));
+        if (!receipt) {
+          throw Object.assign(new Error('销毁回执不存在'), { code: 'RECEIPT_UNKNOWN', status: 404 });
+        }
+        return send(res, 200, redact(receipt, [uploadSecret]));
+      }
+      const receiptVerifyMatch = path.match(/^\/api\/destructions\/([^/]+)\/verify$/);
+      if (receiptVerifyMatch && req.method === 'GET') {
+        const out = lifecycle.verifyReceipt(decodeURIComponent(receiptVerifyMatch[1]));
+        if (!out) {
+          throw Object.assign(new Error('销毁回执不存在'), { code: 'RECEIPT_UNKNOWN', status: 404 });
+        }
+        return send(res, 200, redact(out, [uploadSecret]));
       }
 
       // ---------- 运营：从磁盘重放重建（等价进程重启）----------
@@ -303,8 +538,28 @@ export async function createApp(deps = {}) {
     }
   });
 
+  // 到期任务：周期清扫【期限已到 且 无有效保全】的包（EVIDENCE_SWEEP_MS=0 关闭，测试用手动触发）。
+  const sweepMs = deps.sweepIntervalMs ?? Number(process.env.EVIDENCE_SWEEP_MS ?? 60000);
+  let sweepTimer = null;
+  if (sweepMs > 0) {
+    sweepTimer = setInterval(() => {
+      try {
+        const out = lifecycle.sweep();
+        if (out.destroyed.length || out.errors.length) {
+          logger.log({
+            level: 'info', msg: 'destruction-swept',
+            destroyed: out.destroyed.length, count: out.errors.length,
+          });
+        }
+      } catch (e) {
+        logger.log({ level: 'error', msg: 'destruction-sweep-error', code: e.code, reason: String(e.message).slice(0, 160) });
+      }
+    }, sweepMs);
+    sweepTimer.unref();
+  }
+
   return {
-    server, manager, registry,
+    server, manager, registry, lifecycle,
     get uploadSecret() { return uploadSecret; },
     restartFromDisk,
     start() {
@@ -313,6 +568,7 @@ export async function createApp(deps = {}) {
       });
     },
     stop() {
+      if (sweepTimer) clearInterval(sweepTimer);
       return new Promise((r) => server.close(r));
     },
   };

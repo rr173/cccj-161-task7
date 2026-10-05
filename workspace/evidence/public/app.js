@@ -119,11 +119,15 @@ async function refreshPackages(selectId = SELECTED) {
       ? `v${p.currentFence.version} ${p.currentFence.closed ? '·已关闭' : '·活动'}` : '无围栏';
     const prog = p.currentProgress
       ? `lastSeq=${p.currentProgress.lastSeq}${p.currentProgress.carried ? '·沿用' : ''}` : '无检查点';
+    const holdTag = p.activeHoldCount > 0
+      ? ` <span class="tag warn">保全中 ${p.activeHoldCount}</span>` : '';
+    const retTag = p.retention
+      ? ` <span class="tag ${p.retention.expired ? 'err' : 'info'}">${p.retention.expired ? '已到期' : '期限内'}</span>` : '';
     div.innerHTML = `<div><b>${esc(p.packageId)}</b>
-        <span class="tag ${p.conflictCount ? 'err' : 'ok'}">冲突 ${p.conflictCount}</span></div>
+        <span class="tag ${p.conflictCount ? 'err' : 'ok'}">冲突 ${p.conflictCount}</span>${holdTag}${retTag}</div>
       <div class="muted mono">${esc(p.reportDigest.slice(0, 20))}…</div>
       <div class="muted">围栏：${esc(fence)} ｜ 进度：${esc(prog)} ｜ 记录 ${p.acceptedRecordCount}</div>`;
-    div.onclick = () => { SELECTED = p.packageId; renderDetail(); refreshPackages(p.packageId); };
+    div.onclick = () => { SELECTED = p.packageId; renderDetail(); refreshPackages(p.packageId); loadLifecycle(); };
     $('pkgList').appendChild(div);
   }
   if (selectId && !REPORTS.has(selectId)) SELECTED = null;
@@ -134,8 +138,21 @@ $('btnRefresh').onclick = () => refreshPackages().then(() => toast('已刷新', 
 // ---------- 详情/报告 ----------
 async function renderDetail() {
   if (!SELECTED) return;
-  const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/report`);
-  $('detail').innerHTML = reportHTML(r);
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/report`);
+    $('detail').innerHTML = reportHTML(r);
+  } catch (e) {
+    if (e.code === 'PACKAGE_DESTROYED') {
+      const receiptId = e.details?.receiptId || '';
+      $('detail').innerHTML = `<div class="tag err">已销毁</div>
+        <h3>${esc(SELECTED)} 的证据已销毁</h3>
+        <div class="muted">提交后读接口统一返回已销毁状态（不会看到部分删除）。销毁回执（不含原始证据）仍可在下方 ⑥ 核验。</div>
+        <div style="margin-top:8px">回执：<code>${esc(receiptId)}</code>
+        <button data-receipt="${esc(receiptId)}" class="receipt-view">查看回执</button></div>`;
+      return;
+    }
+    throw e;
+  }
 }
 
 function reportHTML(r) {
@@ -256,3 +273,214 @@ $('btnRestart').onclick = async () => {
 loadGateways().catch(() => {});
 refreshPackages().catch(() => {});
 setInterval(() => refreshPackages().catch(() => {}), 15000);
+
+// ---------- ⑥ 证据保全与到期销毁 ----------
+function newReqId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function loadLifecycle() {
+  if (!SELECTED) {
+    $('lcForms').style.display = 'none';
+    $('lcDetail').textContent = '选择左侧作业包后在此设置期限、发起/解除保全、执行销毁。';
+    return;
+  }
+  $('lcForms').style.display = '';
+  $('retReq').value = $('retReq').value || newReqId('ret');
+  $('holdReq').value = newReqId('hold');
+  let v;
+  try {
+    v = await api(`/api/packages/${encodeURIComponent(SELECTED)}/lifecycle`);
+  } catch (e) {
+    $('lcDetail').innerHTML = `<span class="tag err">${esc(e.code || 'ERR')}</span> ${esc(e.message)}`;
+    return;
+  }
+  const ret = v.retention;
+  const dst = v.destruction;
+  const dstTag = {
+    NONE: '<span class="tag ok">未销毁</span>',
+    PREPARED: '<span class="tag warn">正在提交（中断待恢复）</span>',
+    COMMITTED: '<span class="tag warn">已提交，删除未完成</span>',
+    FAILED: '<span class="tag err">删除失败（可重试）</span>',
+    COMPLETED: '<span class="tag err">已销毁</span>',
+  }[dst.status] || dst.status;
+  $('lcDetail').innerHTML = `
+    <div>状态：${dstTag} ${v.eligible ? '<span class="tag info">可销毁（已到期且无保全）</span>' : ''}</div>
+    <div>保留期限：${ret
+      ? `<code>${esc(ret.retainUntil)}</code>（${ret.expired ? '<span class="tag err">已到期</span>' : '<span class="tag ok">期限内</span>'} · 由 ${esc(ret.setBy)} 设置于 ${esc(ret.setAt)}）`
+      : '<span class="muted">未设置（永不自动销毁）</span>'}</div>
+    <div>有效保全：<b>${v.activeHoldCount}</b> 个 ｜ 阻塞项：${v.blockers.length ? v.blockers.map((b) => `<code>${esc(b)}</code>`).join(' ') : '（无）'}</div>
+    ${dst.receiptId ? `<div>销毁回执：<code>${esc(dst.receiptId)}</code> <button data-receipt="${esc(dst.receiptId)}" class="receipt-view">查看/验签</button></div>` : ''}`;
+  $('btnRetry').style.display = dst.status === 'FAILED' ? '' : 'none';
+  $('btnDestroy').disabled = dst.status === 'COMPLETED';
+  const holds = v.holds || [];
+  $('holdList').innerHTML = holds.length ? `<table class="grid"><thead><tr>
+      <th>保全号</th><th>案件号</th><th>审计人</th><th>原因</th><th>状态</th><th>发起</th><th>解除</th><th></th>
+    </tr></thead><tbody>${holds.map((h) => `<tr>
+      <td class="mono">${esc(h.holdId)}</td>
+      <td>${esc(h.caseNo)}</td>
+      <td>${esc(h.auditor)}</td>
+      <td>${esc(h.reason)}</td>
+      <td>${h.status === 'ACTIVE' ? '<span class="tag warn">有效</span>' : '<span class="tag ok">已解除</span>'}</td>
+      <td class="muted">${esc(h.createdAt)}</td>
+      <td class="muted">${h.releasedAt ? `${esc(h.releasedAt)}${h.releasedBy ? ' · ' + esc(h.releasedBy) : ''}` : '-'}</td>
+      <td>${h.status === 'ACTIVE' ? `<button data-hold="${esc(h.holdId)}" data-case="${esc(h.caseNo)}" class="hold-release">解除</button>` : ''}</td>
+    </tr>`).join('')}</tbody></table>`
+    : '<div class="muted">（无保全记录）</div>';
+}
+
+$('btnRetHour').onclick = () => { $('retUntil').value = new Date(Date.now() + 3600_000).toISOString(); };
+$('btnRetPast').onclick = () => { $('retUntil').value = new Date(Date.now() - 5000).toISOString(); };
+
+$('btnSetRet').onclick = async () => {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/retention`, {
+      method: 'POST', auth: true,
+      body: {
+        requestId: $('retReq').value.trim() || newReqId('ret'),
+        retainUntil: $('retUntil').value.trim(),
+        setBy: $('retBy').value.trim(),
+      },
+    });
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify(r, null, 2));
+    toast(r.replay ? '同一请求号：返回原设置结果（幂等）' : '保留期限已设置', 'ok');
+    $('retReq').value = newReqId('ret');
+    await loadLifecycle(); await refreshPackages();
+  } catch (e) {
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({ code: e.code, error: e.message, details: e.details }, null, 2));
+    toast(`设置期限被拒：${e.code}`, 'err');
+  }
+};
+
+$('btnHold').onclick = async () => {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/holds`, {
+      method: 'POST', auth: true,
+      body: {
+        requestId: $('holdReq').value.trim() || newReqId('hold'),
+        caseNo: $('holdCase').value.trim(),
+        auditor: $('holdAuditor').value.trim(),
+        reason: $('holdReason').value.trim(),
+      },
+    });
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify(r, null, 2));
+    toast(r.replay ? '同一请求号：返回原保全（幂等）' : `保全已发起：${r.holdId}`, 'ok');
+    $('holdReq').value = newReqId('hold');
+    await loadLifecycle(); await refreshPackages();
+  } catch (e) {
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({ code: e.code, error: e.message, details: e.details }, null, 2));
+    toast(`保全被拒：${e.code}`, 'err');
+  }
+};
+
+$('btnDestroy').onclick = async () => {
+  if (!confirm(`确认立即销毁 ${SELECTED}？\n销毁覆盖业务索引/链文件/冲突材料/凭据旁车，提交后读接口统一返回已销毁。`)) return;
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/destroy`, {
+      method: 'POST', auth: true,
+      body: { requestedBy: $('dstBy').value.trim(), reason: $('dstReason').value.trim() },
+    });
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({
+      status: r.status, duplicate: r.duplicate, receiptId: r.receipt.receiptId,
+      removed: r.receipt.removed, receiptHash: r.receipt.receiptHash,
+    }, null, 2));
+    toast(r.duplicate ? '重复执行：返回原回执（未生成第二份）' : `销毁完成，回执 ${r.receipt.receiptId}`, 'ok');
+    await loadLifecycle(); await refreshPackages(); await refreshDestructions();
+  } catch (e) {
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({ code: e.code, error: e.message, details: e.details }, null, 2));
+    toast(`销毁被拒：${e.code}`, 'err');
+    await loadLifecycle();
+  }
+};
+
+$('btnRetry').onclick = async () => {
+  try {
+    const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/destruction/retry`, { method: 'POST', auth: true, body: {} });
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({ status: r.status, receiptId: r.receipt.receiptId }, null, 2));
+    toast('重试完成（同一回执）', 'ok');
+    await loadLifecycle(); await refreshDestructions();
+  } catch (e) {
+    $('lcOut').textContent = ensureNoSecret(JSON.stringify({ code: e.code, error: e.message, details: e.details }, null, 2));
+    toast(`重试失败：${e.code}`, 'err');
+  }
+};
+
+// 解除保全 / 查看回执（事件委托）
+document.addEventListener('click', async (ev) => {
+  const rel = ev.target.closest('.hold-release');
+  if (rel) {
+    const caseNo = prompt(`解除保全 ${rel.dataset.hold}\n请输入案件号核对（错误案件号将被拒 CASE_NO_MISMATCH）：`, rel.dataset.case || '');
+    if (caseNo == null) return;
+    try {
+      const r = await api(`/api/packages/${encodeURIComponent(SELECTED)}/holds/${encodeURIComponent(rel.dataset.hold)}/release`, {
+        method: 'POST', auth: true,
+        body: { requestId: newReqId('rel'), caseNo: caseNo.trim(), releasedBy: 'web-console' },
+      });
+      toast(`保全已解除：${r.holdId}`, 'ok');
+    } catch (e) {
+      toast(`解除被拒：${e.code}（${safeText(e.message)}）`, 'err');
+    }
+    await loadLifecycle(); await refreshPackages();
+    return;
+  }
+  const rv = ev.target.closest('.receipt-view');
+  if (rv) {
+    try {
+      const [receipt, verify] = await Promise.all([
+        api(`/api/destructions/${encodeURIComponent(rv.dataset.receipt)}`),
+        api(`/api/destructions/${encodeURIComponent(rv.dataset.receipt)}/verify`),
+      ]);
+      $('receiptOut').textContent = ensureNoSecret(JSON.stringify({
+        verify: { ok: verify.ok, checks: verify.checks, keyId: verify.keyId },
+        receipt,
+      }, null, 2));
+      toast(verify.ok ? '回执验签通过' : '回执验签失败！', verify.ok ? 'ok' : 'err');
+    } catch (e) { toast(e.message, 'err'); }
+  }
+});
+
+// ---------- 待销毁列表 / 回执 ----------
+async function refreshDestructions() {
+  try {
+    const p = await api('/api/destructions/pending');
+    const sec = (t, arr, fn) => `<h4>${t}（${arr.length}）</h4>${arr.length ? arr.map(fn).join('') : '<div class="muted">（无）</div>'}`;
+    $('pendingList').innerHTML =
+      sec('合格（已到期且无保全）', p.eligible, (x) =>
+        `<div>• <b>${esc(x.packageId)}</b> <span class="muted">期限 ${esc(x.retainUntil)}</span></div>`) +
+      sec('被保全阻塞', p.blocked, (x) =>
+        `<div>• <b>${esc(x.packageId)}</b> <span class="tag warn">保全 ${x.activeHoldCount}</span> <span class="muted">${x.holds.map((h) => esc(h.caseNo)).join('、')}</span></div>`) +
+      sec('在途（提交中/失败）', p.inFlight, (x) =>
+        `<div>• <b>${esc(x.packageId)}</b> <span class="tag ${x.status === 'FAILED' ? 'err' : 'warn'}">${esc(x.status)}</span> ${x.receiptId ? `<code>${esc(x.receiptId)}</code>` : ''}</div>`);
+  } catch (e) {
+    $('pendingList').innerHTML = `<span class="tag err">${esc(e.code || 'ERR')}</span>`;
+  }
+  try {
+    const r = await api('/api/destructions');
+    $('receiptList').innerHTML = r.receipts.length ? `<table class="grid"><thead><tr>
+        <th>回执</th><th>作业包</th><th>提交时间</th><th>状态</th><th>覆盖</th><th></th>
+      </tr></thead><tbody>${r.receipts.map((x) => `<tr>
+        <td class="mono">${esc(x.receiptId.slice(0, 18))}…</td>
+        <td>${esc(x.packageId)}</td>
+        <td class="muted">${esc(x.committedAt)}</td>
+        <td><span class="tag ${x.status === 'COMPLETED' ? 'ok' : 'err'}">${esc(x.status)}</span></td>
+        <td class="muted">链 ${x.removed.chains} · 冲突 ${x.removed.conflictMaterials} · 凭据 ${x.removed.credentialSidecars} · ${x.removed.totalFiles} 文件</td>
+        <td><button data-receipt="${esc(x.receiptId)}" class="receipt-view">验签</button></td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="muted">（尚无销毁回执）</div>';
+  } catch (e) {
+    $('receiptList').innerHTML = `<span class="tag err">${esc(e.code || 'ERR')}</span>`;
+  }
+}
+
+$('btnSweep').onclick = async () => {
+  try {
+    const r = await api('/api/destructions/sweep', { method: 'POST', auth: true, body: {} });
+    $('sweepOut').textContent = ensureNoSecret(JSON.stringify(r, null, 2));
+    toast(`到期清扫完成：销毁 ${r.destroyed.length}，跳过 ${r.skipped.length}，失败 ${r.errors.length}`, 'ok');
+    await refreshDestructions(); await refreshPackages(); await loadLifecycle();
+  } catch (e) { toast(`清扫失败：${e.code}`, 'err'); }
+};
+$('btnRefreshDst').onclick = () => refreshDestructions().then(() => toast('已刷新', 'ok'));
+
+refreshDestructions().catch(() => {});
+setInterval(() => refreshDestructions().catch(() => {}), 20000);

@@ -160,6 +160,8 @@ export function safeLog(fields, literals = []) {
     'recordHash', 'slot', 'kind', 'code', 'reason', 'accepted', 'duplicate',
     'conflict', 'records', 'envelopes', 'tipSeq', 'port', 'file', 'fenceId',
     'version', 'segSeq', 'digest', 'at', 'quarantine', 'count',
+    'holdId', 'caseNo', 'receiptId', 'status', 'auditor', 'requestedBy', 'setBy',
+    'retainUntil', 'removed', 'remaining', 'eligible', 'destroyed', 'blocked',
   ]);
   const out = {};
   for (const [k, v] of Object.entries(fields || {})) {

@@ -57,7 +57,7 @@ export function safeEqual(a, b) {
 }
 
 // 原子写：同目录临时文件 + rename，断电不会留下半截文件。
-function atomicWrite(file, content, mode) {
+export function atomicWrite(file, content, mode) {
   const dir = dirname(file);
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${Date.now()}-${process.pid}.tmp`);
@@ -131,4 +131,36 @@ export function loadOrCreateUploadSecret(file, envValue) {
   const secret = newUploadSecret();
   atomicWrite(file, JSON.stringify({ version: 1, secret, createdAt: new Date().toISOString() }, null, 2) + '\n', 0o600);
   return { secret, source: 'generated', file };
+}
+
+// 销毁回执签名密钥（Ed25519，服务端持有）：data/evidence/destruction-key.json（0600）。
+// 私钥只用于签署销毁回执；公钥经 API 公开，任何人可独立验签。
+export function loadOrCreateDestructionSigner(file, keyId = 'destruction-key-1') {
+  let publicKeyPem; let privateKeyPem; let createdAt;
+  if (file && existsSync(file)) {
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    publicKeyPem = raw.publicKeyPem;
+    privateKeyPem = raw.privateKeyPem;
+    createdAt = raw.createdAt;
+    keyId = raw.keyId || keyId;
+  } else {
+    const pair = generateGatewayKeyPair();
+    publicKeyPem = pair.publicKeyPem;
+    privateKeyPem = pair.privateKeyPem;
+    createdAt = new Date().toISOString();
+    atomicWrite(file, JSON.stringify({
+      version: 1, keyId, publicKeyPem, privateKeyPem, createdAt,
+    }, null, 2) + '\n', 0o600);
+  }
+  return {
+    keyId,
+    publicKeyPem,
+    createdAt,
+    sign(hashHex) {
+      return signEnvelope(privateKeyPem, hashHex);
+    },
+    verify(hashHex, signatureHex) {
+      return verifyEnvelope(publicKeyPem, hashHex, signatureHex);
+    },
+  };
 }

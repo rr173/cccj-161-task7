@@ -14,6 +14,7 @@
     "test:e2e": "node scripts/e2e.mjs",
     "test:e2e:packages": "node scripts/e2e-packages.mjs",
     "test:e2e:evidence": "node scripts/evidence-e2e.mjs",
+    "test:e2e:evidence-destroy": "node scripts/evidence-destroy-e2e.mjs",
     "test:notifier": "node notifier/e2e.mjs"
   },
   "engines": {

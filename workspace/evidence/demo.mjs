@@ -177,7 +177,48 @@ console.log('当前检查点:', report.currentProgress
   ? `fence v${report.currentProgress.fenceVersion} lastSeq=${report.currentProgress.lastSeq}${report.currentProgress.carried ? '（沿用旧围栏，不倒退）' : ''}`
   : '无');
 console.log('冲突隔离:', report.conflicts.length, '条 →', report.conflicts.map((c) => c.reason).join(', '));
+
+// ---------- ⑩ 证据保全与到期销毁演示（独立作业包，不影响上面 9 个场景） ----------
+const DST = `PKG-DEMO-DST-${Date.now().toString(36)}`;
+console.log(`\n⑩ 证据保全与到期销毁（演示包 ${DST}）`);
+const dstManifest = { entries: [{ seq: 0, deviceId: 'DEV-9' }], issuedAt: T, validUntil: null };
+await call(`/api/packages/${DST}/import`, buildEnvelope({
+  packageId: DST, gatewayId: 'gw-A', keyId: KID, privateKeyPem: gwA.privateKeyPem,
+  records: [
+    R.manifest(T, dstManifest, manifestHashOf(dstManifest)),
+    R.fence(T, 'fence-D', 1, 'CREATED'),
+    R.segment(T, 'fence-D', 1, 1, [{ seq: 0, deviceId: 'DEV-9', outcome: 'EXECUTED' }]),
+  ],
+}));
+const past = new Date(Date.now() - 5000).toISOString();
+const future = new Date(Date.now() + 3600_000).toISOString();
+await call(`/api/packages/${DST}/retention`, { requestId: 'demo-ret-1', retainUntil: future, setBy: 'ops-demo' });
+console.log('• 设置保留期限（1 小时后到期）');
+const h1 = await call(`/api/packages/${DST}/holds`, { requestId: 'demo-hold-1', caseNo: 'CASE-DEMO-001', reason: '监管稽查', auditor: 'auditor-1' });
+const h2 = await call(`/api/packages/${DST}/holds`, { requestId: 'demo-hold-2', caseNo: 'CASE-DEMO-002', reason: '民事诉讼', auditor: 'auditor-2' });
+console.log(`• 发起两个保全：${h1.json.holdId}（CASE-DEMO-001）、${h2.json.holdId}（CASE-DEMO-002）`);
+const blocked = await call(`/api/packages/${DST}/destroy`, { requestedBy: 'ops-demo' });
+console.log(`• 保全中销毁 → HTTP ${blocked.status} ${blocked.json.code}（有效保全 ${blocked.json.details?.activeHolds?.length} 个）`);
+const wrongCase = await call(`/api/packages/${DST}/holds/${h1.json.holdId}/release`, { requestId: 'demo-rel-0', caseNo: 'CASE-WRONG' });
+console.log(`• 错误案件号解除 → HTTP ${wrongCase.status} ${wrongCase.json.code}`);
+await call(`/api/packages/${DST}/holds/${h1.json.holdId}/release`, { requestId: 'demo-rel-1', caseNo: 'CASE-DEMO-001', releasedBy: 'auditor-1' });
+const concurrent = await call(`/api/packages/${DST}/holds/${h1.json.holdId}/release`, { requestId: 'demo-rel-2', caseNo: 'CASE-DEMO-001' });
+console.log(`• 并发解除同一保全 → HTTP ${concurrent.status} ${concurrent.json.code}（安全失败）`);
+await call(`/api/packages/${DST}/holds/${h2.json.holdId}/release`, { requestId: 'demo-rel-3', caseNo: 'CASE-DEMO-002', releasedBy: 'auditor-2' });
+await call(`/api/packages/${DST}/retention`, { requestId: 'demo-ret-2', retainUntil: past, setBy: 'ops-demo' });
+console.log('• 全部解除 + 期限届满 → 执行销毁');
+const dst = await call(`/api/packages/${DST}/destroy`, { requestedBy: 'ops-demo', reason: '期限届满' });
+const receipt = dst.json.receipt;
+console.log(`  → 回执 ${receipt.receiptId}（覆盖：链 ${receipt.removed.chains} · 冲突材料 ${receipt.removed.conflictMaterials} · 凭据旁车 ${receipt.removed.credentialSidecars} · 共 ${receipt.removed.totalFiles} 文件）`);
+const again = await call(`/api/packages/${DST}/destroy`, { requestedBy: 'ops-demo' });
+console.log(`• 重复执行 → 同一回执 ${again.json.receipt.receiptId === receipt.receiptId}（不生成第二份）`);
+const gone = await fetch(`${BASE}/api/packages/${DST}/report`);
+console.log(`• 销毁后读报告 → HTTP ${gone.status}（统一已销毁，无部分删除）`);
+const verify = await (await fetch(`${BASE}/api/destructions/${receipt.receiptId}/verify`)).json();
+console.log(`• 回执验签 → ok=${verify.ok}（${Object.entries(verify.checks).map(([k, v]) => `${k}=${v}`).join(' ')}）`);
+
 console.log(`\n打开 ${BASE}/ 选择 ${PKG} 查看时间线/冲突/下载报告（TXT/JSON/HTML，均已脱敏）`);
+console.log(`页面底部 ⑥ 可查看 ${DST} 的销毁回执并验签（公钥：GET /api/destructions/key）`);
 
 if (!keep) {
   setTimeout(() => process.exit(0), 300);
